@@ -1,7 +1,7 @@
 /*
   ------------------------------------------------------------
   LED Matrix WiFi Clock (ESP8266)
-  Author: Adrian Davis (Retooled for NTP Clock)
+  Author: Alex Hughes @alexwhughes
   
   Hardware:
     - ESP8266 (e.g. Wemos D1 mini / NodeMCU / custom ESP8266MOD)
@@ -95,20 +95,20 @@ const char* AP_password = "";
 // [51-90] = ntpServer2 (40 bytes, secondary NTP server)
 // [91-94] = timezone offset (int32_t, seconds)
 // [95-102] = last known timestamp (8 bytes, time_t as uint64_t)
-// [100] = bootCounter (overlaps with timestamp, but boot counter is only used if no valid timestamp)
-// [103] = showDayOfWeek (0=false, 1=true)
-// [104] = showDate (0=false, 1=true)
-// [105] = blinkingColon (0=false, 1=true)
-// [106-107] = clockDisplayDuration (uint16_t, seconds)
-// [108-109] = weatherDisplayDuration (uint16_t, seconds)
-// [110-149] = weatherAPIKey (40 bytes)
-// [150-189] = weatherLocation (40 bytes, lat,lon or city name)
-// [190-229] = customMessage (40 bytes)
-// [230] = customMessageEnabled (0=false, 1=true)
-// [231-232] = customMessageScrollSpeed (uint16_t, 10-200)
+// [103] = bootCounter (moved from 100 to avoid overlapping with timestamp)
+// [104] = showDayOfWeek (0=false, 1=true)
+// [105] = showDate (0=false, 1=true)
+// [106] = blinkingColon (0=false, 1=true)
+// [107-108] = clockDisplayDuration (uint16_t, seconds)
+// [109-110] = weatherDisplayDuration (uint16_t, seconds)
+// [111-150] = weatherAPIKey (40 bytes)
+// [151-190] = weatherLocation (40 bytes, lat,lon or city name)
+// [191-230] = customMessage (40 bytes)
+// [231] = customMessageEnabled (0=false, 1=true)
+// [232-233] = customMessageScrollSpeed (uint16_t, 10-200)
 const uint16_t EEPROM_SIZE = 256;
 const uint16_t EEPROM_TIME_ADDR = 95;
-const uint16_t EEPROM_BOOT_ADDR = 100;
+const uint16_t EEPROM_BOOT_ADDR = 103;
 
 // Default configuration
 struct Config {
@@ -242,34 +242,34 @@ void eepromLoadConfig() {
     
     // New fields (version 3+)
     if (version >= 3) {
-      config.showDayOfWeek = EEPROM.read(103) != 0;
-      config.showDate = EEPROM.read(104) != 0;
-      config.blinkingColon = EEPROM.read(105) != 0;
+      config.showDayOfWeek = EEPROM.read(104) != 0;
+      config.showDate = EEPROM.read(105) != 0;
+      config.blinkingColon = EEPROM.read(106) != 0;
       
       // Clock/weather display durations
-      config.clockDisplayDuration = ((uint16_t)EEPROM.read(106)) | (((uint16_t)EEPROM.read(107)) << 8);
-      config.weatherDisplayDuration = ((uint16_t)EEPROM.read(108)) | (((uint16_t)EEPROM.read(109)) << 8);
+      config.clockDisplayDuration = ((uint16_t)EEPROM.read(107)) | (((uint16_t)EEPROM.read(108)) << 8);
+      config.weatherDisplayDuration = ((uint16_t)EEPROM.read(109)) | (((uint16_t)EEPROM.read(110)) << 8);
       
       // Weather API key
       for (int i = 0; i < 40; i++) {
-        config.weatherAPIKey[i] = (char)EEPROM.read(110 + i);
+        config.weatherAPIKey[i] = (char)EEPROM.read(111 + i);
       }
       config.weatherAPIKey[39] = '\0';
       
       // Weather location
       for (int i = 0; i < 40; i++) {
-        config.weatherLocation[i] = (char)EEPROM.read(150 + i);
+        config.weatherLocation[i] = (char)EEPROM.read(151 + i);
       }
       config.weatherLocation[39] = '\0';
       
       // Custom message
       for (int i = 0; i < 40; i++) {
-        config.customMessage[i] = (char)EEPROM.read(190 + i);
+        config.customMessage[i] = (char)EEPROM.read(191 + i);
       }
       config.customMessage[39] = '\0';
       
-      config.customMessageEnabled = EEPROM.read(230) != 0;
-      config.customMessageScrollSpeed = ((uint16_t)EEPROM.read(231)) | (((uint16_t)EEPROM.read(232)) << 8);
+      config.customMessageEnabled = EEPROM.read(231) != 0;
+      config.customMessageScrollSpeed = ((uint16_t)EEPROM.read(232)) | (((uint16_t)EEPROM.read(233)) << 8);
       if (config.customMessageScrollSpeed < 10 || config.customMessageScrollSpeed > 200) {
         config.customMessageScrollSpeed = 40; // default
       }
@@ -318,37 +318,37 @@ void eepromSaveConfig() {
   }
   
   // New fields (version 3+)
-  EEPROM.write(103, config.showDayOfWeek ? 1 : 0);
-  EEPROM.write(104, config.showDate ? 1 : 0);
-  EEPROM.write(105, config.blinkingColon ? 1 : 0);
+  EEPROM.write(104, config.showDayOfWeek ? 1 : 0);
+  EEPROM.write(105, config.showDate ? 1 : 0);
+  EEPROM.write(106, config.blinkingColon ? 1 : 0);
   
   // Clock/weather display durations
-  EEPROM.write(106, (uint8_t)(config.clockDisplayDuration & 0xFF));
-  EEPROM.write(107, (uint8_t)((config.clockDisplayDuration >> 8) & 0xFF));
-  EEPROM.write(108, (uint8_t)(config.weatherDisplayDuration & 0xFF));
-  EEPROM.write(109, (uint8_t)((config.weatherDisplayDuration >> 8) & 0xFF));
+  EEPROM.write(107, (uint8_t)(config.clockDisplayDuration & 0xFF));
+  EEPROM.write(108, (uint8_t)((config.clockDisplayDuration >> 8) & 0xFF));
+  EEPROM.write(109, (uint8_t)(config.weatherDisplayDuration & 0xFF));
+  EEPROM.write(110, (uint8_t)((config.weatherDisplayDuration >> 8) & 0xFF));
   
   // Weather API key
   for (int i = 0; i < 40; i++) {
     char c = (i < (int)strlen(config.weatherAPIKey)) ? config.weatherAPIKey[i] : 0;
-    EEPROM.write(110 + i, (uint8_t)c);
+    EEPROM.write(111 + i, (uint8_t)c);
   }
   
   // Weather location
   for (int i = 0; i < 40; i++) {
     char c = (i < (int)strlen(config.weatherLocation)) ? config.weatherLocation[i] : 0;
-    EEPROM.write(150 + i, (uint8_t)c);
+    EEPROM.write(151 + i, (uint8_t)c);
   }
   
   // Custom message
   for (int i = 0; i < 40; i++) {
     char c = (i < (int)strlen(config.customMessage)) ? config.customMessage[i] : 0;
-    EEPROM.write(190 + i, (uint8_t)c);
+    EEPROM.write(191 + i, (uint8_t)c);
   }
   
-  EEPROM.write(230, config.customMessageEnabled ? 1 : 0);
-  EEPROM.write(231, (uint8_t)(config.customMessageScrollSpeed & 0xFF));
-  EEPROM.write(232, (uint8_t)((config.customMessageScrollSpeed >> 8) & 0xFF));
+  EEPROM.write(231, config.customMessageEnabled ? 1 : 0);
+  EEPROM.write(232, (uint8_t)(config.customMessageScrollSpeed & 0xFF));
+  EEPROM.write(233, (uint8_t)((config.customMessageScrollSpeed >> 8) & 0xFF));
   
   EEPROM.commit();
   EEPROM.end();
@@ -947,8 +947,12 @@ void handleSave() {
     String start = server.arg("sleepStart");
     int colonPos = start.indexOf(':');
     if (colonPos > 0) {
-      config.sleepStartHour = start.substring(0, colonPos).toInt();
-      config.sleepStartMinute = start.substring(colonPos + 1).toInt();
+      int hour = start.substring(0, colonPos).toInt();
+      int minute = start.substring(colonPos + 1).toInt();
+      if (hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59) {
+        config.sleepStartHour = hour;
+        config.sleepStartMinute = minute;
+      }
     }
   }
   
@@ -956,8 +960,12 @@ void handleSave() {
     String end = server.arg("sleepEnd");
     int colonPos = end.indexOf(':');
     if (colonPos > 0) {
-      config.sleepEndHour = end.substring(0, colonPos).toInt();
-      config.sleepEndMinute = end.substring(colonPos + 1).toInt();
+      int hour = end.substring(0, colonPos).toInt();
+      int minute = end.substring(colonPos + 1).toInt();
+      if (hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59) {
+        config.sleepEndHour = hour;
+        config.sleepEndMinute = minute;
+      }
     }
   }
   
@@ -1153,7 +1161,18 @@ void handleExport() {
   json += "\"blinkingColon\":" + String(config.blinkingColon ? "true" : "false") + ",";
   json += "\"clockDisplayDuration\":" + String(config.clockDisplayDuration) + ",";
   json += "\"weatherDisplayDuration\":" + String(config.weatherDisplayDuration) + ",";
-  json += "\"weatherAPIKey\":\"" + String(config.weatherAPIKey) + "\",";
+  // Mask weatherAPIKey for security - show only last 4 characters
+  String maskedKey = "";
+  int keyLen = strlen(config.weatherAPIKey);
+  if (keyLen > 0) {
+    if (keyLen <= 4) {
+      maskedKey = String(config.weatherAPIKey);
+    } else {
+      maskedKey = "****";
+      maskedKey += String(config.weatherAPIKey + keyLen - 4);
+    }
+  }
+  json += "\"weatherAPIKey\":\"" + maskedKey + "\",";
   json += "\"weatherLocation\":\"" + String(config.weatherLocation) + "\",";
   json += "\"customMessage\":\"" + String(config.customMessage) + "\",";
   json += "\"customMessageEnabled\":" + String(config.customMessageEnabled ? "true" : "false") + ",";
