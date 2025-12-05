@@ -39,12 +39,13 @@
 
 #define HARDWARE_TYPE MD_MAX72XX::PAROLA_HW
 #define MAX_DEVICES   4
+// Note: Each MAX7219 is 8x8, so 4 devices = 32 columns x 8 rows
 
 // Pins for ESP8266 (numeric GPIOs)
 #define PIN_CS   15    // D8 on many dev boards
 #define PIN_CLK  14    // D5
 #define PIN_DIN  13    // D7
-#define PIN_ORIENTATION  16    // D0 - Orientation detection pin (HIGH = flip display)
+#define PIN_ORIENTATION  16    // D0 - Orientation detection pin (LOW = flip display vertically)
 
 MD_Parola P = MD_Parola(HARDWARE_TYPE, PIN_CS, MAX_DEVICES);
 
@@ -106,6 +107,7 @@ const char* AP_password = "";
 // [191-230] = customMessage (40 bytes)
 // [231] = customMessageEnabled (0=false, 1=true)
 // [232-233] = customMessageScrollSpeed (uint16_t, 10-200)
+// [234] = clockScrollEnabled (0=false, 1=true) - version 4+
 const uint16_t EEPROM_SIZE = 256;
 const uint16_t EEPROM_TIME_ADDR = 95;
 const uint16_t EEPROM_BOOT_ADDR = 103;
@@ -126,6 +128,7 @@ struct Config {
   bool showDayOfWeek;
   bool showDate;
   bool blinkingColon;
+  bool clockScrollEnabled;  // Allow clock to scroll if text doesn't fit
   uint16_t clockDisplayDuration;  // seconds
   uint16_t weatherDisplayDuration;  // seconds
   char weatherAPIKey[40];
@@ -149,9 +152,10 @@ void initConfigDefaults() {
   strcpy(config.ntpServer, "pool.ntp.org");
   strcpy(config.ntpServer2, "");
   config.timezoneOffset = 0;
-  config.showDayOfWeek = true;
+  config.showDayOfWeek = false;  // Disabled by default
   config.showDate = false;
   config.blinkingColon = true;
+  config.clockScrollEnabled = true;  // Allow scrolling by default
   config.clockDisplayDuration = 10;
   config.weatherDisplayDuration = 5;
   strcpy(config.weatherAPIKey, "");
@@ -182,10 +186,15 @@ unsigned long lastTimeDisplay = 0;
 const unsigned long timeDisplayInterval = 1000; // Update every second
 DisplayMode currentDisplayMode = MODE_CLOCK;
 unsigned long modeStartTime = 0;
+  // Track last displayed time to avoid resetting scroll animation unnecessarily
+int lastDisplayedHour = -1;
+int lastDisplayedMinute = -1;
 bool colonBlinkState = false;
 unsigned long lastColonBlink = 0;
 const unsigned long colonBlinkInterval = 500; // 500ms blink
 bool displayFlipped = false;  // Orientation flip state (read from GPIO16)
+unsigned long lastOrientationCheck = 0;
+const unsigned long orientationCheckInterval = 2000; // Check every 2 seconds
 
 // Time save interval (save to EEPROM every 5 minutes to preserve time across power loss)
 unsigned long lastTimeSave = 0;
@@ -203,7 +212,10 @@ String weatherDescription = "";
 void eepromLoadConfig() {
   EEPROM.begin(EEPROM_SIZE);
   
-  if (EEPROM.read(0) == 'L' && EEPROM.read(1) == 'M') {
+  uint8_t magic1 = EEPROM.read(0);
+  uint8_t magic2 = EEPROM.read(1);
+  
+  if (magic1 == 'L' && magic2 == 'M') {
     uint8_t version = EEPROM.read(2);
     
     // Valid header
@@ -273,11 +285,16 @@ void eepromLoadConfig() {
       if (config.customMessageScrollSpeed < 10 || config.customMessageScrollSpeed > 200) {
         config.customMessageScrollSpeed = 40; // default
       }
+      
+      // Version 4+ fields
+      if (version >= 4) {
+        config.clockScrollEnabled = EEPROM.read(234) != 0;
+      } else {
+        config.clockScrollEnabled = true; // default for old configs
+      }
+    } else {
+      config.clockScrollEnabled = true; // default
     }
-    
-    Serial.println("[EEPROM] Config loaded");
-  } else {
-    Serial.println("[EEPROM] No valid config, using defaults");
   }
   
   EEPROM.end();
@@ -288,7 +305,7 @@ void eepromSaveConfig() {
   
   EEPROM.write(0, 'L');
   EEPROM.write(1, 'M');
-  EEPROM.write(2, 3); // version 3 (with weather/messages)
+  EEPROM.write(2, 4); // version 4 (with clock scroll option)
   
   EEPROM.write(3, config.brightness);
   EEPROM.write(4, config.timeFormat);
@@ -350,10 +367,12 @@ void eepromSaveConfig() {
   EEPROM.write(232, (uint8_t)(config.customMessageScrollSpeed & 0xFF));
   EEPROM.write(233, (uint8_t)((config.customMessageScrollSpeed >> 8) & 0xFF));
   
+  // Version 4+ fields
+  EEPROM.write(234, config.clockScrollEnabled ? 1 : 0);
+  
   EEPROM.commit();
   EEPROM.end();
   
-  Serial.println("[EEPROM] Config saved");
 }
 
 uint8_t eepromReadBootCounter() {
@@ -382,8 +401,6 @@ void eepromSaveTime(time_t t) {
   
   EEPROM.commit();
   EEPROM.end();
-  
-  Serial.printf("[EEPROM] Saved time: %lu\n", (unsigned long)t);
 }
 
 // Load last known time from EEPROM
@@ -408,11 +425,9 @@ time_t eepromLoadTime() {
   
   // Validate: time should be reasonable (after 2020, before 2100)
   if (t > 1577836800 && t < 4102444800) {  // 2020-01-01 to 2100-01-01
-    Serial.printf("[EEPROM] Loaded stored time: %lu\n", (unsigned long)t);
     return t;
   }
   
-  Serial.println("[EEPROM] No valid stored time");
   return 0;
 }
 
@@ -426,10 +441,14 @@ void setMatrixBrightnessFromPercent(int percent) {
   P.setIntensity(intensity);
 }
 
-void setTextNow(const String& txt) {
+void setTextNow(const String& txt, bool forceStatic = false) {
+  Serial.printf("[Display] setTextNow: input='%s' (len:%d, forceStatic:%s)\n", 
+                 txt.c_str(), txt.length(), forceStatic ? "YES" : "NO");
+  
   if (txt.length() == 0) {
     P.displayClear();
     textScrolls = false;
+    Serial.println("[Display] setTextNow: Empty text, cleared");
     return;
   }
   
@@ -437,11 +456,15 @@ void setTextNow(const String& txt) {
   size_t len = txt.length();
   if (len >= sizeof(matrixText)) {
     len = sizeof(matrixText) - 1;
+    Serial.printf("[Display] WARNING: Text truncated from %d to %d\n", txt.length(), len);
   }
   for (size_t i = 0; i < len; i++) {
     matrixText[i] = txt[i];
   }
   matrixText[len] = '\0';
+  
+  Serial.printf("[Display] Buffer: '%s' (len:%d, maxCols:%d)\n", 
+                 matrixText, len, MAX_DEVICES * 8);
   
   P.setFont(nullptr);
   P.setInvert(config.invertDisplay);
@@ -451,12 +474,28 @@ void setTextNow(const String& txt) {
   uint16_t textWidth = len * charWidth;
   bool textFits = (textWidth <= maxCols) || (len <= 5);
   
+  // If forceStatic is true, always display as static (truncate if needed)
+  bool willScroll = !forceStatic && !textFits;
+  
+  Serial.printf("[Display] textWidth:%d, textFits:%s, forceStatic:%s, willScroll:%s\n",
+                 textWidth, textFits ? "YES" : "NO", forceStatic ? "YES" : "NO", willScroll ? "YES" : "NO");
+  
   P.displayClear();
   
-  if (textFits) {
+  if (!willScroll) {
     textScrolls = false;
     P.setTextAlignment(PA_CENTER);
+    // If text doesn't fit and we're forcing static, truncate it
+    if (forceStatic && !textFits && len > 0) {
+      // Truncate to fit - remove day icon and space if present, or truncate from end
+      size_t displayLen = (maxCols / charWidth) - 1; // Leave some margin
+      if (displayLen < len) {
+        matrixText[displayLen] = '\0';
+        Serial.printf("[Display] Truncated to '%s' (len:%d) for static display\n", matrixText, displayLen);
+      }
+    }
     P.print(matrixText);
+    Serial.println("[Display] Displaying static centered text");
   } else {
     textScrolls = true;
     P.displayText(
@@ -468,6 +507,7 @@ void setTextNow(const String& txt) {
       PA_SCROLL_RIGHT
     );
     P.displayReset();
+    Serial.println("[Display] Displaying scrolling text");
   }
 }
 
@@ -484,6 +524,11 @@ time_t getCurrentTime() {
     time_t now = time(nullptr);
     if (now > 100000) {
       return now;
+    } else {
+      static int logCount = 0;
+      if (logCount++ % 30 == 0) {
+        Serial.printf("[Time] getCurrentTime: NTP synced but time too small: %lu\n", now);
+      }
     }
   }
   
@@ -496,6 +541,12 @@ time_t getCurrentTime() {
     if (elapsedSeconds < 604800) {  // 7 days
       return currentTime;
     }
+  }
+  
+  static int noTimeCount = 0;
+  if (noTimeCount++ % 60 == 0) {
+    Serial.printf("[Time] getCurrentTime: No valid time (synced:%s, hasStored:%s)\n", 
+                   timeSynced ? "yes" : "no", hasStoredTime ? "yes" : "no");
   }
   
   return 0;  // No valid time available
@@ -529,12 +580,17 @@ void syncTime() {
   
   // Wait for time to be set
   int retries = 0;
+  Serial.println("[NTP] Waiting for time sync...");
   while (time(nullptr) < 100000 && retries < 20) {
     delay(500);
     retries++;
+    time_t current = time(nullptr);
+    Serial.printf("[NTP] Retry %d/%d, time value: %lu\n", retries, 20, current);
   }
   
   time_t now = time(nullptr);
+  Serial.printf("[NTP] Final time check: %lu (threshold: 100000)\n", now);
+  
   if (now > 100000) {
     timeSynced = true;
     
@@ -545,29 +601,31 @@ void syncTime() {
     eepromSaveTime(now);
     
     struct tm* timeinfo = localtime(&now);
-    Serial.printf("[NTP] Time synced: %04d-%02d-%02d %02d:%02d:%02d\n",
+    Serial.printf("[NTP] Synced: %04d-%02d-%02d %02d:%02d:%02d (wday:%d)\n",
                   timeinfo->tm_year + 1900, timeinfo->tm_mon + 1, timeinfo->tm_mday,
-                  timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
+                  timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec, timeinfo->tm_wday);
   } else {
     // Try secondary server if primary failed
     if (strlen(config.ntpServer2) > 0 && ntpServerToUse == config.ntpServer) {
-      Serial.println("[NTP] Primary server failed, trying secondary...");
+      Serial.println("[NTP] ✗ Primary server failed, trying secondary...");
       configTime(config.timezoneOffset, 0, config.ntpServer2);
+      Serial.printf("[NTP] Waiting 2 seconds for secondary server...\n");
       delay(2000);
       now = time(nullptr);
+      Serial.printf("[NTP] Secondary server time check: %lu\n", now);
       if (now > 100000) {
         timeSynced = true;
         storedTime = now;
         storedTimeMillis = millis();
         hasStoredTime = true;
         eepromSaveTime(now);
-        Serial.println("[NTP] Time synced with secondary server");
+        Serial.print("[NTP] Synced (secondary)\n");
       } else {
-        Serial.println("[NTP] Time sync failed on both servers");
+        Serial.print("[NTP] Failed\n");
         timeSynced = false;
       }
     } else {
-      Serial.println("[NTP] Time sync failed");
+      Serial.print("[NTP] Failed\n");
       timeSynced = false;
     }
   }
@@ -577,7 +635,7 @@ void syncTime() {
 char getDayOfWeekIcon(int dayOfWeek) {
   // dayOfWeek: 0=Sunday, 1=Monday, ..., 6=Saturday
   // Using simple ASCII characters as icons
-  char icons[] = {'@', '=', '+', '!', '#', '$', '%'};
+  char icons[] = {'@', '=', '+', '!', '#', 'F', '%'};
   if (dayOfWeek >= 0 && dayOfWeek <= 6) {
     return icons[dayOfWeek];
   }
@@ -588,6 +646,7 @@ String formatTime() {
   time_t now = getCurrentTime();
   
   if (now == 0) {
+    Serial.println("[Time] formatTime: No time available, returning 'NO TIME'");
     return "NO TIME";
   }
   
@@ -595,6 +654,7 @@ String formatTime() {
   
   int hour = timeinfo->tm_hour;
   int minute = timeinfo->tm_min;
+  int wday = timeinfo->tm_wday;
   bool isPM = false;
   
   if (config.timeFormat == 1) { // 12h format
@@ -611,18 +671,25 @@ String formatTime() {
   
   // Add day of week icon if enabled
   if (config.showDayOfWeek) {
-    result += getDayOfWeekIcon(timeinfo->tm_wday);
+    char icon = getDayOfWeekIcon(wday);
+    result += icon;
     result += " ";
+    Serial.printf("[Time] formatTime: Day icon='%c' (wday=%d, showDayOfWeek=%s)\n", 
+                   icon, wday, config.showDayOfWeek ? "true" : "false");
   }
   
   // Format time with blinking colon
   char colon = config.blinkingColon && colonBlinkState ? ' ' : ':';
+  
   if (config.timeFormat == 1) {
     snprintf(timeStr, sizeof(timeStr), "%d%c%02d%s", hour, colon, minute, isPM ? "PM" : "AM");
   } else {
     snprintf(timeStr, sizeof(timeStr), "%02d%c%02d", hour, colon, minute);
   }
   result += String(timeStr);
+  
+  Serial.printf("[Time] formatTime: raw(h:%02d m:%02d wday:%d) -> result='%s' (len:%d)\n",
+                 timeinfo->tm_hour, minute, wday, result.c_str(), result.length());
   
   return result;
 }
@@ -864,6 +931,14 @@ void handleRoot() {
   html += "</div>";
   
   html += "<div class='form-group'>";
+  html += "<label>Clock Scroll Enabled:</label>";
+  html += "<select name='clockScrollEnabled'>";
+  html += "<option value='0'" + String(!config.clockScrollEnabled ? " selected" : "") + ">Disabled (static only)</option>";
+  html += "<option value='1'" + String(config.clockScrollEnabled ? " selected" : "") + ">Enabled (scroll if needed)</option>";
+  html += "</select>";
+  html += "</div>";
+  
+  html += "<div class='form-group'>";
   html += "<label>Clock Display Duration (seconds):</label>";
   html += "<input type='number' name='clockDisplayDuration' min='1' max='60' value='" + String(config.clockDisplayDuration) + "'>";
   html += "</div>";
@@ -992,6 +1067,10 @@ void handleSave() {
   
   if (server.hasArg("blinkingColon")) {
     config.blinkingColon = (server.arg("blinkingColon").toInt() != 0);
+  }
+  
+  if (server.hasArg("clockScrollEnabled")) {
+    config.clockScrollEnabled = (server.arg("clockScrollEnabled").toInt() != 0);
   }
   
   if (server.hasArg("clockDisplayDuration")) {
@@ -1159,6 +1238,7 @@ void handleExport() {
   json += "\"showDayOfWeek\":" + String(config.showDayOfWeek ? "true" : "false") + ",";
   json += "\"showDate\":" + String(config.showDate ? "true" : "false") + ",";
   json += "\"blinkingColon\":" + String(config.blinkingColon ? "true" : "false") + ",";
+  json += "\"clockScrollEnabled\":" + String(config.clockScrollEnabled ? "true" : "false") + ",";
   json += "\"clockDisplayDuration\":" + String(config.clockDisplayDuration) + ",";
   json += "\"weatherDisplayDuration\":" + String(config.weatherDisplayDuration) + ",";
   // Mask weatherAPIKey for security - show only last 4 characters
@@ -1231,43 +1311,62 @@ void startConfigPortal() {
 void connectToNetwork() {
   WiFi.mode(WIFI_STA);
   
-  Serial.printf("[Boot] Cached boot counter (prev boot) = %u\n", bootCountCached);
+  Serial.printf("[WiFi] connectToNetwork: Starting WiFi connection\n");
+  Serial.printf("[WiFi] Boot counter (prev boot) = %u, BOOT_FAIL_LIMIT = %u\n", bootCountCached, BOOT_FAIL_LIMIT);
+  Serial.printf("[WiFi] Device ID: %s\n", deviceID.c_str());
+  
+  // Check if WiFiManager has saved credentials
+  Serial.println("[WiFi] Checking for saved WiFi credentials...");
   
   wifiManager.setConfigPortalTimeout(180);
+  Serial.println("[WiFi] Config portal timeout set to 180 seconds");
   
   wifiManager.setAPCallback([](WiFiManager* wm) {
     Serial.println("[WiFi] Config portal started");
+    Serial.printf("[WiFi] AP SSID: %s\n", wm->getConfigPortalSSID().c_str());
     showConfigModeMessage();
   });
   
   if (bootCountCached >= BOOT_FAIL_LIMIT) {
+    Serial.println("[WiFi] Boot counter >= limit, forcing config portal");
     startConfigPortal();
+  } else {
+    Serial.println("[WiFi] Boot counter OK, attempting auto-connect");
   }
   
+  Serial.println("[WiFi] Calling wifiManager.autoConnect()...");
   bool res = wifiManager.autoConnect(deviceID.c_str(), AP_password);
   
   if (!res) {
-    Serial.println("[WiFi] Failed to connect, restarting...");
+    Serial.println("[WiFi] autoConnect FAILED - restarting device");
     showBootMessage("WiFi ERR");
     delay(1000);
     ESP.restart();
   } else {
-    Serial.print("[WiFi] Connected: ");
-    Serial.println(WiFi.localIP());
+    Serial.println("[WiFi] autoConnect SUCCESS");
+    Serial.printf("[WiFi] SSID: %s\n", WiFi.SSID().c_str());
+    Serial.printf("[WiFi] IP Address: %s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("[WiFi] RSSI: %d dBm\n", WiFi.RSSI());
+    Serial.printf("[WiFi] MAC Address: %s\n", WiFi.macAddress().c_str());
     showBootMessage("WiFi OK");
     delay(1000);
   }
   
   eepromWriteBootCounter(0);
-  Serial.println("[Boot] Boot counter reset to 0 (WiFi OK)");
+  Serial.println("[WiFi] Boot counter reset to 0 (WiFi OK)");
 }
 
 // ------------------------ SETUP ----------------------------
 
 void setup() {
+  // Initialize serial with longer delay to ensure stability
   Serial.begin(115200);
-  Serial.println();
-  Serial.println("[LEDMatrix] Booting...");
+  delay(500);  // Longer delay for serial to stabilize
+  Serial.flush();
+  
+  // Simple test pattern to verify serial is working
+  Serial.print("\n\n=== BOOT ===\n");
+  delay(50);
   
   // Build deviceID from MAC
   WiFi.mode(WIFI_STA);
@@ -1284,39 +1383,58 @@ void setup() {
   deviceID += macBuf;
   deviceID.toUpperCase();
   
-  Serial.println("[ID] deviceID = " + deviceID);
+  Serial.print("[ID] ");
+  Serial.println(deviceID);
+  delay(50);
   WiFi.hostname(deviceID);
   
   // Initialize default config values
   initConfigDefaults();
+  Serial.print("[CFG] Defaults loaded\n");
+  delay(50);
   
   // Load config from EEPROM (will overwrite defaults if valid config exists)
   eepromLoadConfig();
+  
+  Serial.print("[CFG] EEPROM loaded\n");
+  delay(50);
   
   // Load stored time from EEPROM
   storedTime = eepromLoadTime();
   if (storedTime > 0) {
     storedTimeMillis = millis();
     hasStoredTime = true;
-    Serial.println("[Boot] Using stored time from previous session");
   } else {
     hasStoredTime = false;
-    Serial.println("[Boot] No stored time available");
   }
   
   // Check orientation pin (GPIO16) to determine if display should be flipped
-  // GPIO16 on ESP8266: Connect to GND to flip display, leave floating for normal orientation
-  // Note: GPIO16 has special characteristics on ESP8266 (used for deep sleep wake-up)
+  // GPIO16 on ESP8266: Connect to GND (LOW) to flip display, leave floating for normal
+  // Note: GPIO16 has special characteristics - no internal pull-up, used for deep sleep
+  // We need to read it multiple times to get a stable reading
   pinMode(PIN_ORIENTATION, INPUT);
-  delay(10);  // Allow pin to stabilize
-  // Read pin state: LOW (connected to GND) = flip, HIGH (floating/pulled up) = normal
-  // For GPIO16, we use INPUT mode (it has internal pull-down characteristics)
-  int pinState = digitalRead(PIN_ORIENTATION);
-  displayFlipped = (pinState == LOW);  // LOW = flip display
-  Serial.printf("[Orientation] GPIO%d state: %s, Display flipped: %s\n", 
-                PIN_ORIENTATION, 
-                pinState == HIGH ? "HIGH" : "LOW",
-                displayFlipped ? "YES" : "NO");
+  delay(50);  // Allow pin to stabilize longer
+  
+  // Read pin multiple times to get stable reading (GPIO16 can be flaky)
+  int highCount = 0;
+  int lowCount = 0;
+  for (int i = 0; i < 10; i++) {
+    int state = digitalRead(PIN_ORIENTATION);
+    if (state == HIGH) {
+      highCount++;
+    } else {
+      lowCount++;
+    }
+    delay(5);
+  }
+  
+  // Determine pin state based on majority reading
+  int pinState = (highCount > lowCount) ? HIGH : LOW;
+  displayFlipped = (pinState == LOW);  // LOW (GND) = flip display
+  
+  Serial.printf("[Orientation] GPIO16 readings: HIGH=%d, LOW=%d, final=%s, flip=%s\n",
+                 highCount, lowCount, pinState == HIGH ? "HIGH" : "LOW",
+                 displayFlipped ? "YES" : "NO");
   
   // Matrix init
   P.begin();
@@ -1324,15 +1442,20 @@ void setup() {
   P.setInvert(config.invertDisplay);
   P.displayClear();
   
+  // Configure zone to use all 4 devices (32 columns x 8 rows)
   P.setZone(0, 0, MAX_DEVICES - 1);
-  // Apply orientation flip based on GPIO16 pin state
+  // Always apply horizontal flip to fix backwards text (hardware wiring requirement)
+  // Apply vertical flip based on GPIO16 pin state (if needed)
+  // LOW (GND) = flip display vertically (upside down), HIGH (floating) = normal
+  uint8_t flipEffect = PA_FLIP_LR;  // Always flip horizontally
   if (displayFlipped) {
-    P.setZoneEffect(0, true, PA_FLIP_LR);
-    Serial.println("[Orientation] Display flipped left-right");
+    // Pin is LOW (GND) - also flip display vertically (upside down)
+    flipEffect |= PA_FLIP_UD;
+    Serial.println("[Orientation] Display FLIPPED HORIZONTALLY + VERTICALLY (GPIO16=LOW)");
   } else {
-    P.setZoneEffect(0, false, PA_FLIP_LR);
-    Serial.println("[Orientation] Display normal orientation");
+    Serial.println("[Orientation] Display FLIPPED HORIZONTALLY only (GPIO16=HIGH)");
   }
+  P.setZoneEffect(0, true, flipEffect);
   
   // Boot counter logic
   bootCountCached = eepromReadBootCounter();
@@ -1341,7 +1464,6 @@ void setup() {
     newCount++;
   }
   eepromWriteBootCounter(newCount);
-  Serial.printf("[Boot] Boot counter previous=%u, new=%u\n", bootCountCached, newCount);
   
   showBootMessage("BOOT");
   delay(1000);
@@ -1363,7 +1485,19 @@ void setup() {
   // Show IP
   String ipMsg = "IP " + WiFi.localIP().toString();
   showBootMessage(ipMsg);
-  delay(2000);
+  // Wait for IP message to display, but allow animation
+  unsigned long ipStart = millis();
+  while (millis() - ipStart < 2000) {
+    if (P.displayAnimate()) {
+      if (textScrolls) {
+        P.displayReset();
+      }
+    }
+    yield();
+  }
+  // Clear any scrolling state before transitioning to clock
+  textScrolls = false;
+  P.displayClear();
   
   // Setup web server
   server.on("/", handleRoot);
@@ -1393,7 +1527,13 @@ void setup() {
   currentDisplayMode = MODE_CLOCK;
   modeStartTime = millis();
   
-  Serial.println("[System] Setup complete, entering loop");
+  // Force display update after boot - clear any scrolling text and show clock
+  textScrolls = false;
+  lastTimeDisplay = 0; // Force immediate update in loop
+  P.displayClear();
+  
+  Serial.print("[SYS] Ready\n");
+  delay(50);
 }
 
 // ------------------------ LOOP -----------------------------
@@ -1427,9 +1567,10 @@ void loop() {
   if (config.blinkingColon && (now - lastColonBlink >= colonBlinkInterval)) {
     lastColonBlink = now;
     colonBlinkState = !colonBlinkState;
-    // Force redraw if in clock mode
-    if (currentDisplayMode == MODE_CLOCK && !displaySleeping) {
-      lastTimeDisplay = 0; // Force update
+    // For scrolling text, don't force update - let the animation continue
+    // Only update if text is static (fits on screen)
+    if (currentDisplayMode == MODE_CLOCK && !displaySleeping && !textScrolls) {
+      lastTimeDisplay = 0; // Force update only for static text
     }
   }
   
@@ -1474,6 +1615,7 @@ void loop() {
     
     // Switch to next mode if needed
     if (shouldSwitchMode) {
+      DisplayMode oldMode = currentDisplayMode;
       switch (currentDisplayMode) {
         case MODE_CLOCK:
           if (config.showDate) {
@@ -1504,17 +1646,55 @@ void loop() {
           currentDisplayMode = MODE_CLOCK;
           break;
       }
+      Serial.printf("[Display] Mode switch: %d -> %d\n", oldMode, currentDisplayMode);
       modeStartTime = now;
+      // Reset tracked time when switching modes
+      lastDisplayedHour = -1;
+      lastDisplayedMinute = -1;
     }
     
     // Display current mode
     if (now - lastTimeDisplay >= timeDisplayInterval || shouldSwitchMode) {
+      Serial.printf("[Display] Updating mode %d (interval:%lu, shouldSwitch:%s)\n",
+                     currentDisplayMode, now - lastTimeDisplay, shouldSwitchMode ? "YES" : "NO");
       lastTimeDisplay = now;
       
       switch (currentDisplayMode) {
-        case MODE_CLOCK:
-          setTextNow(formatTime());
+        case MODE_CLOCK: {
+          // Get current time to check if it actually changed
+          time_t nowTime = getCurrentTime();
+          bool timeChanged = false;
+          
+          if (nowTime > 0) {
+            struct tm* timeinfo = localtime(&nowTime);
+            int currentHour = timeinfo->tm_hour;
+            int currentMinute = timeinfo->tm_min;
+            
+            // Only update if hour or minute changed (not just colon blink)
+            if (currentHour != lastDisplayedHour || currentMinute != lastDisplayedMinute) {
+              timeChanged = true;
+              lastDisplayedHour = currentHour;
+              lastDisplayedMinute = currentMinute;
+              Serial.printf("[Display] MODE_CLOCK: Time changed to %02d:%02d\n", currentHour, currentMinute);
+            } else if (!textScrolls) {
+              // For static text, update on colon blink
+              timeChanged = true;
+              Serial.println("[Display] MODE_CLOCK: Colon blink update (static text)");
+            } else {
+              Serial.println("[Display] MODE_CLOCK: Skipping update (scrolling, time unchanged)");
+            }
+          } else {
+            // No time available, always update
+            timeChanged = true;
+            Serial.println("[Display] MODE_CLOCK: No time, forcing update");
+          }
+          
+          if (timeChanged) {
+            // Pass forceStatic=true if clock scrolling is disabled
+            setTextNow(formatTime(), !config.clockScrollEnabled);
+          }
           break;
+        }
         case MODE_WEATHER:
           if (weatherAvailable) {
             char tempStr[16];
@@ -1582,7 +1762,6 @@ void loop() {
       storedTime = currentTime;
       storedTimeMillis = millis();
       lastTimeSave = now;
-      Serial.println("[EEPROM] Periodically saved time");
     }
   }
   
@@ -1590,6 +1769,41 @@ void loop() {
   if (P.displayAnimate()) {
     if (textScrolls) {
       P.displayReset();
+    }
+  }
+  
+  // Periodically check orientation pin for dynamic changes
+  if (now - lastOrientationCheck >= orientationCheckInterval) {
+    lastOrientationCheck = now;
+    
+    // Read pin multiple times for stability
+    int highCount = 0;
+    int lowCount = 0;
+    for (int i = 0; i < 5; i++) {
+      int state = digitalRead(PIN_ORIENTATION);
+      if (state == HIGH) {
+        highCount++;
+      } else {
+        lowCount++;
+      }
+      delay(2);
+    }
+    
+    int pinState = (highCount > lowCount) ? HIGH : LOW;
+    bool newFlipped = (pinState == LOW);
+    
+    // Only update if state changed
+    if (newFlipped != displayFlipped) {
+      displayFlipped = newFlipped;
+      // Horizontal flip is always enabled, combine with vertical flip if needed
+      uint8_t flipEffect = PA_FLIP_LR;  // Always flip horizontally
+      if (displayFlipped) {
+        flipEffect |= PA_FLIP_UD;  // Also flip vertically
+        Serial.println("[Orientation] Changed: FLIPPED HORIZONTALLY + VERTICALLY (GPIO16=LOW)");
+      } else {
+        Serial.println("[Orientation] Changed: FLIPPED HORIZONTALLY only (GPIO16=HIGH)");
+      }
+      P.setZoneEffect(0, true, flipEffect);
     }
   }
   
