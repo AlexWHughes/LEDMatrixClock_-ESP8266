@@ -155,7 +155,7 @@ void initConfigDefaults() {
   config.showDayOfWeek = false;  // Disabled by default
   config.showDate = false;
   config.blinkingColon = true;
-  config.clockScrollEnabled = true;  // Allow scrolling by default
+  config.clockScrollEnabled = false;  // Disable scrolling by default (static display only)
   config.clockDisplayDuration = 10;
   config.weatherDisplayDuration = 5;
   strcpy(config.weatherAPIKey, "");
@@ -170,7 +170,6 @@ const uint8_t BOOT_FAIL_LIMIT = 1;
 uint8_t bootCountCached = 0;
 
 // Time sync
-const char* defaultNTP = "pool.ntp.org";
 unsigned long lastTimeUpdate = 0;
 const unsigned long timeUpdateInterval = 3600000; // 1 hour
 bool timeSynced = false;
@@ -218,15 +217,27 @@ void eepromLoadConfig() {
   if (magic1 == 'L' && magic2 == 'M') {
     uint8_t version = EEPROM.read(2);
     
-    // Valid header
-    config.brightness = EEPROM.read(3);
-    config.timeFormat = EEPROM.read(4);
+    // Valid header - load and validate values
+    uint8_t brightness = EEPROM.read(3);
+    config.brightness = (brightness <= 100) ? brightness : 50;  // Validate 0-100
+    
+    uint8_t timeFormat = EEPROM.read(4);
+    config.timeFormat = (timeFormat <= 1) ? timeFormat : 0;  // Validate 0-1
+    
     config.invertDisplay = EEPROM.read(5) != 0;
     config.sleepEnabled = EEPROM.read(6) != 0;
-    config.sleepStartHour = EEPROM.read(7);
-    config.sleepStartMinute = EEPROM.read(8);
-    config.sleepEndHour = EEPROM.read(9);
-    config.sleepEndMinute = EEPROM.read(10);
+    
+    uint8_t sleepStartHour = EEPROM.read(7);
+    config.sleepStartHour = (sleepStartHour <= 23) ? sleepStartHour : 18;
+    
+    uint8_t sleepStartMinute = EEPROM.read(8);
+    config.sleepStartMinute = (sleepStartMinute <= 59) ? sleepStartMinute : 30;
+    
+    uint8_t sleepEndHour = EEPROM.read(9);
+    config.sleepEndHour = (sleepEndHour <= 23) ? sleepEndHour : 9;
+    
+    uint8_t sleepEndMinute = EEPROM.read(10);
+    config.sleepEndMinute = (sleepEndMinute <= 59) ? sleepEndMinute : 0;
     
     // NTP server
     for (int i = 0; i < 40; i++) {
@@ -259,8 +270,11 @@ void eepromLoadConfig() {
       config.blinkingColon = EEPROM.read(106) != 0;
       
       // Clock/weather display durations
-      config.clockDisplayDuration = ((uint16_t)EEPROM.read(107)) | (((uint16_t)EEPROM.read(108)) << 8);
-      config.weatherDisplayDuration = ((uint16_t)EEPROM.read(109)) | (((uint16_t)EEPROM.read(110)) << 8);
+      uint16_t clockDur = ((uint16_t)EEPROM.read(107)) | (((uint16_t)EEPROM.read(108)) << 8);
+      config.clockDisplayDuration = (clockDur >= 1 && clockDur <= 60) ? clockDur : 10;
+      
+      uint16_t weatherDur = ((uint16_t)EEPROM.read(109)) | (((uint16_t)EEPROM.read(110)) << 8);
+      config.weatherDisplayDuration = (weatherDur >= 1 && weatherDur <= 60) ? weatherDur : 5;
       
       // Weather API key
       for (int i = 0; i < 40; i++) {
@@ -290,10 +304,10 @@ void eepromLoadConfig() {
       if (version >= 4) {
         config.clockScrollEnabled = EEPROM.read(234) != 0;
       } else {
-        config.clockScrollEnabled = true; // default for old configs
+        config.clockScrollEnabled = false; // default for old configs (match new default)
       }
     } else {
-      config.clockScrollEnabled = true; // default
+      config.clockScrollEnabled = false; // default (match initConfigDefaults)
     }
   }
   
@@ -433,6 +447,26 @@ time_t eepromLoadTime() {
 
 // ------------------------ MATRIX HELPERS --------------------
 
+// Read orientation pin with debouncing (returns true if pin is LOW/flipped)
+bool readOrientationPin(int samples = 10) {
+  int highCount = 0;
+  int lowCount = 0;
+  for (int i = 0; i < samples; i++) {
+    int state = digitalRead(PIN_ORIENTATION);
+    if (state == HIGH) {
+      highCount++;
+    } else {
+      lowCount++;
+    }
+    if (samples > 5) {
+      delay(5);  // Longer delay for initial setup
+    } else {
+      delay(2);  // Shorter delay for periodic checks
+    }
+  }
+  return (lowCount > highCount);  // LOW (GND) = flipped
+}
+
 void setMatrixBrightnessFromPercent(int percent) {
   if (percent < 0)   percent = 0;
   if (percent > 100) percent = 100;
@@ -534,12 +568,16 @@ time_t getCurrentTime() {
   
   // Use stored time + elapsed milliseconds
   if (hasStoredTime && storedTime > 0) {
-    unsigned long elapsedSeconds = (millis() - storedTimeMillis) / 1000;
-    time_t currentTime = storedTime + elapsedSeconds;
-    
-    // Validate: don't use if more than 7 days old (likely wrong)
-    if (elapsedSeconds < 604800) {  // 7 days
-      return currentTime;
+    unsigned long elapsedMillis = millis() - storedTimeMillis;
+    // Handle millis() overflow (wraps every ~49 days)
+    if (elapsedMillis < 0x7FFFFFFF) {  // Only if no overflow
+      unsigned long elapsedSeconds = elapsedMillis / 1000;
+      time_t currentTime = storedTime + elapsedSeconds;
+      
+      // Validate: don't use if more than 7 days old (likely wrong)
+      if (elapsedSeconds < 604800) {  // 7 days
+        return currentTime;
+      }
     }
   }
   
@@ -559,12 +597,8 @@ void syncTime() {
     return;
   }
   
-  // Use secondary NTP server if primary fails
+  // Use primary NTP server first (secondary will be used as fallback if primary fails)
   const char* ntpServerToUse = config.ntpServer;
-  if (strlen(config.ntpServer2) > 0) {
-    // Try primary first, fallback to secondary if needed
-    ntpServerToUse = config.ntpServer;
-  }
   
   configTime(config.timezoneOffset, 0, ntpServerToUse);
   Serial.print("[NTP] Syncing with ");
@@ -1002,12 +1036,17 @@ void handleRoot() {
 
 void handleSave() {
   if (server.hasArg("brightness")) {
-    config.brightness = server.arg("brightness").toInt();
-    if (config.brightness > 100) config.brightness = 100;
+    int b = server.arg("brightness").toInt();
+    if (b >= 0 && b <= 100) {
+      config.brightness = b;
+    }
   }
   
   if (server.hasArg("timeFormat")) {
-    config.timeFormat = server.arg("timeFormat").toInt();
+    int tf = server.arg("timeFormat").toInt();
+    if (tf == 0 || tf == 1) {
+      config.timeFormat = tf;
+    }
   }
   
   if (server.hasArg("invertDisplay")) {
@@ -1045,16 +1084,27 @@ void handleSave() {
   }
   
   if (server.hasArg("ntpServer")) {
-    server.arg("ntpServer").toCharArray(config.ntpServer, sizeof(config.ntpServer));
+    String ntp = server.arg("ntpServer");
+    ntp.trim();
+    size_t len = (ntp.length() < sizeof(config.ntpServer)) ? ntp.length() : sizeof(config.ntpServer) - 1;
+    ntp.toCharArray(config.ntpServer, len + 1);
+    config.ntpServer[len] = '\0';
   }
   
   if (server.hasArg("ntpServer2")) {
-    server.arg("ntpServer2").toCharArray(config.ntpServer2, sizeof(config.ntpServer2));
+    String ntp2 = server.arg("ntpServer2");
+    ntp2.trim();
+    size_t len = (ntp2.length() < sizeof(config.ntpServer2)) ? ntp2.length() : sizeof(config.ntpServer2) - 1;
+    ntp2.toCharArray(config.ntpServer2, len + 1);
+    config.ntpServer2[len] = '\0';
   }
   
   if (server.hasArg("timezoneOffset")) {
     float hours = server.arg("timezoneOffset").toFloat();
-    config.timezoneOffset = (int32_t)(hours * 3600);
+    // Validate timezone offset: -12 to +14 hours
+    if (hours >= -12.0 && hours <= 14.0) {
+      config.timezoneOffset = (int32_t)(hours * 3600);
+    }
   }
   
   if (server.hasArg("showDayOfWeek")) {
@@ -1086,17 +1136,28 @@ void handleSave() {
   }
   
   if (server.hasArg("weatherAPIKey")) {
-    server.arg("weatherAPIKey").toCharArray(config.weatherAPIKey, sizeof(config.weatherAPIKey));
+    String key = server.arg("weatherAPIKey");
+    key.trim();
+    size_t len = (key.length() < sizeof(config.weatherAPIKey)) ? key.length() : sizeof(config.weatherAPIKey) - 1;
+    key.toCharArray(config.weatherAPIKey, len + 1);
+    config.weatherAPIKey[len] = '\0';
   }
   
   if (server.hasArg("weatherLocation")) {
-    server.arg("weatherLocation").toCharArray(config.weatherLocation, sizeof(config.weatherLocation));
+    String loc = server.arg("weatherLocation");
+    loc.trim();
+    size_t len = (loc.length() < sizeof(config.weatherLocation)) ? loc.length() : sizeof(config.weatherLocation) - 1;
+    loc.toCharArray(config.weatherLocation, len + 1);
+    config.weatherLocation[len] = '\0';
   }
   
   if (server.hasArg("customMessage")) {
     String msg = server.arg("customMessage");
+    msg.trim();
     msg.toUpperCase();
-    msg.toCharArray(config.customMessage, sizeof(config.customMessage));
+    size_t len = (msg.length() < sizeof(config.customMessage)) ? msg.length() : sizeof(config.customMessage) - 1;
+    msg.toCharArray(config.customMessage, len + 1);
+    config.customMessage[len] = '\0';
     config.customMessageEnabled = (strlen(config.customMessage) > 0);
   }
   
@@ -1163,8 +1224,10 @@ void handleSetMessage() {
     message = sanitized;
     
     // Store message
-    message.toCharArray(config.customMessage, sizeof(config.customMessage));
-    config.customMessageEnabled = (message.length() > 0);
+    size_t len = (message.length() < sizeof(config.customMessage)) ? message.length() : sizeof(config.customMessage) - 1;
+    message.toCharArray(config.customMessage, len + 1);
+    config.customMessage[len] = '\0';
+    config.customMessageEnabled = (strlen(config.customMessage) > 0);
     
     if (server.hasArg("speed")) {
       speed = server.arg("speed").toInt();
@@ -1309,7 +1372,13 @@ void startConfigPortal() {
 }
 
 void connectToNetwork() {
+  // Disconnect any existing WiFi connection and clear saved state
+  // This ensures WiFiManager can properly use saved credentials
+  WiFi.disconnect(true);
+  delay(100);
+  
   WiFi.mode(WIFI_STA);
+  delay(100);
   
   Serial.printf("[WiFi] connectToNetwork: Starting WiFi connection\n");
   Serial.printf("[WiFi] Boot counter (prev boot) = %u, BOOT_FAIL_LIMIT = %u\n", bootCountCached, BOOT_FAIL_LIMIT);
@@ -1369,6 +1438,8 @@ void setup() {
   delay(50);
   
   // Build deviceID from MAC
+  // Set persistent mode BEFORE setting WiFi mode to ensure credentials are saved/loaded
+  WiFi.persistent(true);
   WiFi.mode(WIFI_STA);
   delay(100);
   
@@ -1411,30 +1482,12 @@ void setup() {
   // Check orientation pin (GPIO16) to determine if display should be flipped
   // GPIO16 on ESP8266: Connect to GND (LOW) to flip display, leave floating for normal
   // Note: GPIO16 has special characteristics - no internal pull-up, used for deep sleep
-  // We need to read it multiple times to get a stable reading
   pinMode(PIN_ORIENTATION, INPUT);
-  delay(50);  // Allow pin to stabilize longer
+  delay(50);  // Allow pin to stabilize
   
-  // Read pin multiple times to get stable reading (GPIO16 can be flaky)
-  int highCount = 0;
-  int lowCount = 0;
-  for (int i = 0; i < 10; i++) {
-    int state = digitalRead(PIN_ORIENTATION);
-    if (state == HIGH) {
-      highCount++;
-    } else {
-      lowCount++;
-    }
-    delay(5);
-  }
+  displayFlipped = readOrientationPin(10);  // Use 10 samples for initial setup
   
-  // Determine pin state based on majority reading
-  int pinState = (highCount > lowCount) ? HIGH : LOW;
-  displayFlipped = (pinState == LOW);  // LOW (GND) = flip display
-  
-  Serial.printf("[Orientation] GPIO16 readings: HIGH=%d, LOW=%d, final=%s, flip=%s\n",
-                 highCount, lowCount, pinState == HIGH ? "HIGH" : "LOW",
-                 displayFlipped ? "YES" : "NO");
+  Serial.printf("[Orientation] GPIO16: flip=%s\n", displayFlipped ? "YES (LOW)" : "NO (HIGH)");
   
   // Matrix init
   P.begin();
@@ -1447,10 +1500,10 @@ void setup() {
   // Always apply horizontal flip to fix backwards text (hardware wiring requirement)
   // Apply vertical flip based on GPIO16 pin state (if needed)
   // LOW (GND) = flip display vertically (upside down), HIGH (floating) = normal
-  uint8_t flipEffect = PA_FLIP_LR;  // Always flip horizontally
+  zoneEffect_t flipEffect = PA_FLIP_LR;  // Always flip horizontally
   if (displayFlipped) {
     // Pin is LOW (GND) - also flip display vertically (upside down)
-    flipEffect |= PA_FLIP_UD;
+    flipEffect = (zoneEffect_t)(PA_FLIP_LR | PA_FLIP_UD);
     Serial.println("[Orientation] Display FLIPPED HORIZONTALLY + VERTICALLY (GPIO16=LOW)");
   } else {
     Serial.println("[Orientation] Display FLIPPED HORIZONTALLY only (GPIO16=HIGH)");
@@ -1551,9 +1604,12 @@ void loop() {
   }
   
   // Also try initial sync if we haven't synced yet and WiFi is connected
-  if (!timeSynced && WiFi.status() == WL_CONNECTED && (now - lastTimeUpdate >= 5000)) {
-    lastTimeUpdate = now;
-    syncTime();
+  // Check if lastTimeUpdate is 0 (first boot) or enough time has passed
+  if (!timeSynced && WiFi.status() == WL_CONNECTED) {
+    if (lastTimeUpdate == 0 || (now - lastTimeUpdate >= 5000)) {
+      lastTimeUpdate = now;
+      syncTime();
+    }
   }
   
   // Fetch weather periodically
@@ -1648,9 +1704,10 @@ void loop() {
       }
       Serial.printf("[Display] Mode switch: %d -> %d\n", oldMode, currentDisplayMode);
       modeStartTime = now;
-      // Reset tracked time when switching modes
+      // Reset tracked time and scroll state when switching modes
       lastDisplayedHour = -1;
       lastDisplayedMinute = -1;
+      textScrolls = false;  // Reset scroll state on mode switch
     }
     
     // Display current mode
@@ -1670,12 +1727,13 @@ void loop() {
             int currentHour = timeinfo->tm_hour;
             int currentMinute = timeinfo->tm_min;
             
-            // Only update if hour or minute changed (not just colon blink)
-            if (currentHour != lastDisplayedHour || currentMinute != lastDisplayedMinute) {
+            // Always update when switching modes, or if time changed
+            if (shouldSwitchMode || currentHour != lastDisplayedHour || currentMinute != lastDisplayedMinute) {
               timeChanged = true;
               lastDisplayedHour = currentHour;
               lastDisplayedMinute = currentMinute;
-              Serial.printf("[Display] MODE_CLOCK: Time changed to %02d:%02d\n", currentHour, currentMinute);
+              Serial.printf("[Display] MODE_CLOCK: Time changed to %02d:%02d (switch:%s)\n", 
+                           currentHour, currentMinute, shouldSwitchMode ? "YES" : "NO");
             } else if (!textScrolls) {
               // For static text, update on colon blink
               timeChanged = true;
@@ -1696,20 +1754,36 @@ void loop() {
           break;
         }
         case MODE_WEATHER:
-          if (weatherAvailable) {
-            char tempStr[16];
-            snprintf(tempStr, sizeof(tempStr), "%.0f°C", currentTemperature);
-            setTextNow(String(tempStr));
-          } else {
-            setTextNow("! TEMP");
+          // Only update weather when switching modes (weather doesn't change frequently)
+          if (shouldSwitchMode) {
+            if (weatherAvailable) {
+              char tempStr[16];
+              snprintf(tempStr, sizeof(tempStr), "%.0f°C", currentTemperature);
+              setTextNow(String(tempStr));
+            } else {
+              setTextNow("! TEMP");
+            }
           }
           break;
         case MODE_DATE:
-          setTextNow(formatDate());
+          // Only update date when switching modes or if date might have changed
+          if (shouldSwitchMode) {
+            setTextNow(formatDate());
+          }
           break;
         case MODE_CUSTOM_MESSAGE:
-          if (config.customMessageEnabled && strlen(config.customMessage) > 0) {
-            // Use custom scroll speed for messages
+          // Check if custom message is still enabled/valid (always check, not just on mode switch)
+          if (!config.customMessageEnabled || strlen(config.customMessage) == 0) {
+            // Message was disabled/cleared, switch back to clock
+            currentDisplayMode = MODE_CLOCK;
+            modeStartTime = now;
+            lastDisplayedHour = -1;
+            lastDisplayedMinute = -1;
+            textScrolls = false;
+            Serial.println("[Display] Custom message cleared, switching to clock");
+          } else if (shouldSwitchMode) {
+            // Only update display when switching modes (message is static)
+            // Custom messages use their own scroll speed, so handle separately
             String msg = String(config.customMessage);
             size_t len = msg.length();
             if (len >= sizeof(matrixText)) {
@@ -1738,16 +1812,13 @@ void loop() {
               P.displayText(
                 matrixText,
                 PA_LEFT,
-                config.customMessageScrollSpeed,
+                config.customMessageScrollSpeed,  // Use custom scroll speed
                 scrollPause,
                 PA_SCROLL_RIGHT,
                 PA_SCROLL_RIGHT
               );
               P.displayReset();
             }
-          } else {
-            currentDisplayMode = MODE_CLOCK;
-            modeStartTime = now;
           }
           break;
       }
@@ -1776,29 +1847,15 @@ void loop() {
   if (now - lastOrientationCheck >= orientationCheckInterval) {
     lastOrientationCheck = now;
     
-    // Read pin multiple times for stability
-    int highCount = 0;
-    int lowCount = 0;
-    for (int i = 0; i < 5; i++) {
-      int state = digitalRead(PIN_ORIENTATION);
-      if (state == HIGH) {
-        highCount++;
-      } else {
-        lowCount++;
-      }
-      delay(2);
-    }
-    
-    int pinState = (highCount > lowCount) ? HIGH : LOW;
-    bool newFlipped = (pinState == LOW);
+    bool newFlipped = readOrientationPin(5);  // Use 5 samples for periodic checks
     
     // Only update if state changed
     if (newFlipped != displayFlipped) {
       displayFlipped = newFlipped;
       // Horizontal flip is always enabled, combine with vertical flip if needed
-      uint8_t flipEffect = PA_FLIP_LR;  // Always flip horizontally
+      zoneEffect_t flipEffect = PA_FLIP_LR;  // Always flip horizontally
       if (displayFlipped) {
-        flipEffect |= PA_FLIP_UD;  // Also flip vertically
+        flipEffect = (zoneEffect_t)(PA_FLIP_LR | PA_FLIP_UD);  // Also flip vertically
         Serial.println("[Orientation] Changed: FLIPPED HORIZONTALLY + VERTICALLY (GPIO16=LOW)");
       } else {
         Serial.println("[Orientation] Changed: FLIPPED HORIZONTALLY only (GPIO16=HIGH)");
